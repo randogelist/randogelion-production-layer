@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+*.env
+.aws/
+*.pem
+*.key
+*.secret
+data/rng_magazine.bin
+.DS_Store
