@@ -14,7 +14,7 @@ from api.backend.models import (
     RandomRequest,
 )
 from api.backend.storage import ObjectStorage
-from api.backend.usage import record_delivered_usage
+from api.backend.usage import record_delivered_usage, units_2048bit
 
 _MAGAZINE_LOCK = threading.Lock()
 _MAGAZINE_OFFSETS: dict[str, int] = {}
@@ -33,16 +33,17 @@ def get_embedded_magazine_status(settings: Settings) -> dict:
         "size_bytes": size,
         "consumed_bytes": consumed,
         "remaining_bytes": remaining,
+        "unit_bytes": settings.rng_unit_bytes,
+        "remaining_2048bit_units": remaining // settings.rng_unit_bytes,
         "max_request_bytes": settings.rng_magazine_max_request_bytes,
-        "remaining_1024_byte_requests": remaining // 1024,
-        "note": "Pseudo-production test: magazine cursor is in-memory and resets if the ECS task restarts.",
+        "note": "Monthly embedded inventory mode: cursor is in-memory in this prototype and resets if the ECS task restarts.",
     }
 
 
 def read_embedded_magazine(settings: Settings, byte_count: int) -> bytes:
     if byte_count > settings.rng_magazine_max_request_bytes:
         raise ValueError(
-            f"Embedded magazine direct requests are limited to {settings.rng_magazine_max_request_bytes} bytes"
+            f"Embedded magazine requests are limited to {settings.rng_magazine_max_request_bytes} bytes"
         )
 
     path = settings.rng_magazine_path
@@ -76,13 +77,27 @@ class RngService:
 
     def handle_random_request(self, request: RandomRequest, customer: MarketplaceCustomer):
         request_id = str(uuid.uuid4())
+
+        if request.bytes > self.settings.paid_max_request_bytes:
+            raise ValueError(f"Requests above {self.settings.paid_max_request_bytes} bytes need a custom interface")
+
         wants_direct = request.delivery == "direct" or (
             request.delivery == "auto" and request.bytes <= self.settings.max_direct_response_bytes
         )
 
         if wants_direct:
             if request.bytes > self.settings.max_direct_response_bytes:
-                raise ValueError("Direct responses above MAX_DIRECT_RESPONSE_BYTES are disabled")
+                raise ValueError("Direct response limit exceeded")
+
+            try:
+                plan_charged = self.repo.reserve_customer_quota(
+                    customer.internal_customer_id,
+                    request.bytes,
+                    self.settings.free_tier_bytes,
+                    self.settings.free_tier_max_request_bytes,
+                )
+            except PermissionError as exc:
+                raise PermissionError(str(exc)) from exc
 
             if self.settings.rng_provider == "embedded_magazine":
                 data = read_embedded_magazine(self.settings, request.bytes)
@@ -91,9 +106,13 @@ class RngService:
             else:
                 raise ValueError(f"Unknown RNG_PROVIDER={self.settings.rng_provider}")
 
-            record_delivered_usage(self.repo, self.settings, customer, request.bytes)
+            refreshed_customer = self.repo.get_customer_by_internal_id(customer.internal_customer_id) or customer
+            record_delivered_usage(self.repo, self.settings, refreshed_customer, request.bytes, request_id, plan_charged)
             return RandomDirectResponse(
                 bytes=request.bytes,
+                units_2048bit=units_2048bit(request.bytes, self.settings.rng_unit_bytes),
+                plan_charged=plan_charged,
+                free_bytes_remaining=max(refreshed_customer.free_bytes_limit - refreshed_customer.free_bytes_used, 0),
                 data_b64=base64.b64encode(data).decode("ascii"),
                 request_id=request_id,
             )
@@ -138,6 +157,6 @@ class RngService:
 
         customer = self.repo.get_customer_by_internal_id(job.internal_customer_id)
         if customer:
-            record_delivered_usage(self.repo, self.settings, customer, byte_count)
+            record_delivered_usage(self.repo, self.settings, customer, byte_count, job.request_id, customer.plan)
 
         return job

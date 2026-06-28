@@ -41,7 +41,7 @@ class MarketplaceClient:
             {
                 "CustomerIdentifier": record.customer_identifier,
                 "Dimension": record.dimension,
-                "Quantity": record.quantity_gb,
+                "Quantity": record.quantity,
                 "Timestamp": record.created_at,
             }
             for record in usage_records

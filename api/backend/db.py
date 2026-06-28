@@ -10,6 +10,7 @@ from api.backend.models import (
     JobRecord,
     JobStatus,
     MarketplaceCustomer,
+    Plan,
     UsageRecord,
 )
 
@@ -22,14 +23,16 @@ class Repository:
     """Repository boundary.
 
     The in-memory implementation is for local development only. In production,
-    implement the same methods with DynamoDB or Postgres so ECS task restarts do
-    not lose customer/job/usage state.
+    implement the same methods with DynamoDB/Postgres and move request queueing
+    to SQS/Redis so ECS task restarts do not lose state.
     """
 
     def upsert_customer(self, customer: MarketplaceCustomer) -> MarketplaceCustomer: ...
     def get_customer_by_internal_id(self, internal_customer_id: str) -> MarketplaceCustomer | None: ...
     def get_customer_by_marketplace_id(self, customer_identifier: str) -> MarketplaceCustomer | None: ...
     def set_customer_status(self, customer_identifier: str, status: CustomerStatus) -> None: ...
+    def set_customer_plan(self, customer_identifier: str, plan: Plan) -> None: ...
+    def reserve_customer_quota(self, internal_customer_id: str, byte_count: int, free_limit: int, free_max_request: int) -> Plan: ...
 
     def create_api_key(self, internal_customer_id: str, api_key_hash: str) -> ApiKeyRecord: ...
     def find_api_key_hash(self, api_key_hash: str) -> ApiKeyRecord | None: ...
@@ -75,8 +78,40 @@ class InMemoryRepository(Repository):
             customer = self.get_customer_by_marketplace_id(customer_identifier)
             if customer:
                 customer.status = status
+                if status == CustomerStatus.active and customer.plan == Plan.free:
+                    customer.plan = Plan.subscription
                 customer.updated_at = now_utc()
                 self.customers[customer.internal_customer_id] = customer
+
+    def set_customer_plan(self, customer_identifier: str, plan: Plan) -> None:
+        with self._lock:
+            customer = self.get_customer_by_marketplace_id(customer_identifier)
+            if customer:
+                customer.plan = plan
+                customer.updated_at = now_utc()
+                self.customers[customer.internal_customer_id] = customer
+
+    def reserve_customer_quota(self, internal_customer_id: str, byte_count: int, free_limit: int, free_max_request: int) -> Plan:
+        with self._lock:
+            customer = self.customers.get(internal_customer_id)
+            if not customer:
+                raise ValueError("Customer not found")
+
+            free_remaining = max(customer.free_bytes_limit - customer.free_bytes_used, 0)
+            if customer.plan == Plan.free:
+                if byte_count > free_max_request:
+                    raise PermissionError(f"Free tier requests are limited to {free_max_request} bytes")
+                if byte_count > free_remaining:
+                    raise PermissionError("Free tier exhausted; subscription required")
+                customer.free_bytes_used += byte_count
+                customer.updated_at = now_utc()
+                self.customers[internal_customer_id] = customer
+                return Plan.free
+
+            customer.paid_bytes_used += byte_count
+            customer.updated_at = now_utc()
+            self.customers[internal_customer_id] = customer
+            return customer.plan
 
     def create_api_key(self, internal_customer_id: str, api_key_hash: str) -> ApiKeyRecord:
         with self._lock:
@@ -148,7 +183,10 @@ class InMemoryRepository(Repository):
 
     def list_unmetered_usage(self) -> list[UsageRecord]:
         with self._lock:
-            return [record for record in self.usage.values() if not record.metered]
+            return [
+                record for record in self.usage.values()
+                if record.billable and not record.metered
+            ]
 
     def mark_usage_metered(self, usage_ids: Iterable[str]) -> None:
         with self._lock:

@@ -16,6 +16,12 @@ class CustomerStatus(str, Enum):
     suspended = "suspended"
 
 
+class Plan(str, Enum):
+    free = "free"
+    subscription = "subscription"
+    custom = "custom"
+
+
 class JobStatus(str, Enum):
     queued = "queued"
     claimed = "claimed"
@@ -30,6 +36,10 @@ class MarketplaceCustomer(BaseModel):
     product_code: str
     license_arn: str | None = None
     status: CustomerStatus = CustomerStatus.pending
+    plan: Plan = Plan.free
+    free_bytes_limit: int = 2 * 1024 * 1024
+    free_bytes_used: int = 0
+    paid_bytes_used: int = 0
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -43,13 +53,16 @@ class ApiKeyRecord(BaseModel):
 
 
 class RandomRequest(BaseModel):
-    bytes: int = Field(gt=0, le=1_000_000_000, description="Number of random bytes requested")
+    bytes: int = Field(gt=0, le=2 * 1024 * 1024, description="Number of random bytes requested")
     delivery: Literal["auto", "direct", "job"] = "auto"
 
 
 class RandomDirectResponse(BaseModel):
     mode: Literal["direct"] = "direct"
     bytes: int
+    units_2048bit: int
+    plan_charged: Plan
+    free_bytes_remaining: int
     encoding: Literal["base64"] = "base64"
     data_b64: str
     request_id: str
@@ -106,11 +119,14 @@ class WorkerCompleteRequest(BaseModel):
 
 class UsageRecord(BaseModel):
     usage_id: str
+    request_id: str
     internal_customer_id: str
     customer_identifier: str
     dimension: str
-    quantity_gb: int
+    quantity: int
     raw_bytes: int
+    plan_charged: Plan
+    billable: bool = True
     metered: bool = False
     created_at: datetime = Field(default_factory=utcnow)
     metered_at: datetime | None = None
